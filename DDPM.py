@@ -1,81 +1,61 @@
 import math
 import torch
 from torch import nn
+import experiment
 
 # 设定参数 数据参数
 batch_size = 64
+channel = 3
 height = 32
 width = 32
 T = 100  # 总时间步数
 beta_begin = 0.0001
 beta_end = 0.02
 
-# 类别编码嵌入
-def Label_embedding_with_Pic_util(x, label_embedding):
-    in_channels = label_embedding.shape[1]
-    out_channels = x.shape[1] // 2
-    fc = nn.Linear(in_features=in_channels, out_features=out_channels)
-    label_vector = fc(label_embedding)
-    mapping_label_embedding = label_vector.unsqueeze(-1).unsqueeze(-1)
-    mapping_label_embedding = mapping_label_embedding.expand(batch_size, -1, height, width)
-    combine = torch.cat([x, mapping_label_embedding], dim=1)
-    return combine
-
-# 类别编码
-class Label_Embedding(nn.Module):
-    def __init__(self, num_classes:int, embedding_dim:int):
-        super().__init__()
-        self.dim = embedding_dim
+class Embedding_Util:
+    def __init__(self, num_classes:int, sum_timestep:int, dim:int):
         self.num_classes = num_classes
-        positions = torch.arange(self.num_classes).unsqueeze(1).float()
+        self.sun_timestep = sum_timestep
+        self.dim = dim
+        label_position = positions = torch.arange(self.num_classes).unsqueeze(1).float()
+        time_position = torch.arange(self.sun_timestep).unsqueeze(1).float()
         div = torch.exp(torch.arange(0, self.dim, 2).float() * -(math.log(10000.0) / self.dim))
-        embeddings = torch.zeros((self.num_classes, self.dim))
-        embeddings[:, 0::2] = torch.sin(positions * div)
-        embeddings[:, 1::2] = torch.cos(positions * div)
-        self.embeddings = embeddings
 
-    def forward(self, labels):
-        embeds = self.embeddings[labels]
-        return embeds
+        label_embeddings = torch.zeros((self.num_classes, self.dim))
+        label_embeddings[:, 0::2] = torch.sin(label_position * div)
+        label_embeddings[:, 1::2] = torch.cos(label_position * div)
+        self.label_embeddings = label_embeddings
 
+        time_embeddings = torch.zeros((self.sun_timestep, self.dim))
+        time_embeddings[:, 0::2] = torch.sin(time_position * div)
+        time_embeddings[:, 1::2] = torch.cos(time_position * div)
+        self.time_embeddings = time_embeddings
+
+    def label_embedding(self, x, label):
+        label_encoder = self.label_embeddings[label]
+        in_channel = label_encoder.shape[1]
+        out_channel = channel
+        fc = nn.Linear(in_features=in_channel, out_features=out_channel)
+        label_vector = fc(label_encoder)
+        mapping_label_embedding = label_vector.unsqueeze(-1).unsqueeze(-1)
+        mapping_label_embedding = mapping_label_embedding.expand(batch_size, -1, height, width)
+        combine = torch.cat([x, mapping_label_embedding], dim=1)
+        return combine
+
+    def time_embedding(self, x, time_step):
+        time_encoder = self.time_embeddings[time_step]
+        in_channels = time_encoder.shape[1]
+        out_channels = channel
+        fc = nn.Linear(in_features=in_channels, out_features=out_channels)
+        time_vector = fc(time_encoder)
+        mapping_time_embedding = time_vector.unsqueeze(-1).unsqueeze(-1)
+        mapping_time_embedding = mapping_time_embedding.expand(batch_size, -1, height, width)
+        combine = torch.cat([x, mapping_time_embedding], dim=1)
+        return combine
 
 # 跨层连接的第一步
 def skipped_connect(x, encode):
     return torch.cat([x,encode], dim=1)
-
-
-
-# 时间步编码嵌入
-def Time_Embedding_with_Pic_utils(x, time_embedding):
-    in_channels = time_embedding.shape[1]
-    out_channels = x.shape[1]
-    fc = nn.Linear(in_features=in_channels,out_features=out_channels)
-    time_vector = fc(time_embedding)
-    mapping_time_embedding = time_vector.unsqueeze(-1).unsqueeze(-1)
-    mapping_time_embedding = mapping_time_embedding.expand(batch_size,-1,height,width)
-    combine = torch.cat([mapping_time_embedding,x],dim=1)
-    return combine
-
-
-
-# 生成时间步编码
-class Time_Embedding(nn.Module):
-    def __init__(self, Time_steps:int, dim:int):
-        super(Time_Embedding, self).__init__()
-        self.dim = dim
-        self.Time_step = Time_steps
-        positions = torch.arange(self.Time_step).unsqueeze(1).float()
-        div = torch.exp(torch.arange(0,self.dim,2).float() * -(math.log(10000.0)/self.dim))
-        embeddings = torch.zeros((self.Time_step,self.dim))
-        embeddings[:,0::2] = torch.sin(positions * div)
-        embeddings[:,1::2] = torch.cos(positions * div)
-        self.embeddings = embeddings
-
-    def forward(self,t):
-        embeds = self.embeddings[t]
-        return embeds
-
-
 
 # 生成绝对位置编码
 class Position_Embedding(nn.Module):
@@ -145,7 +125,7 @@ class SelfAttention(nn.Module):
 
 
 # 加噪过程中的参数选择
-class Diffusion_Forward:
+class Diffusion:
     def __init__(self, num_time_steps:int, beta_src:float=0.0001, beta_cls:float=0.02):
         self.time_step = num_time_steps
         self.beta_src = beta_src
@@ -158,15 +138,36 @@ class Diffusion_Forward:
         self.sqrt_one_minus_cumpord_alphas = torch.sqrt(1-self.cumpord_alphas)
         self.sqrt_cumpord_alphas = torch.sqrt(self.alphas)
 
-    def noising_adding(self, x_0, time_step):
+    def forward(self, x_0, time_step):
         noise = torch.randn_like(x_0)
         batch_sqrt_cumpord_alphas = self.sqrt_cumpord_alphas[time_step].view([x_0.shape[0],1,1,1])
         batch_sqrt_one_minus_cumpord_alphas = self.sqrt_one_minus_cumpord_alphas[time_step].view([x_0.shape[0],1,1,1])
 
-        return (x_0*batch_sqrt_cumpord_alphas+
-                noise*batch_sqrt_one_minus_cumpord_alphas)
+        return (x_0*batch_sqrt_cumpord_alphas+noise*batch_sqrt_one_minus_cumpord_alphas,
+                noise)
 
+    def prediction(self, model, time_step, x):
+        with torch.no_grad():
+            step = math.ceil(time_step[0] / 16)
+            sub = 1
+            for i in reversed(range(time_step[0])):
+                one_divide_sqrt_alpha = 1 / torch.sqrt(self.alphas[i])
+                one_minus_alpha = 1 - self.alphas[i]
+                sqrt_one_minus_cumpord_alpha = self.sqrt_one_minus_cumpord_alphas[i]
+                sqrt_betas = torch.sqrt(self.betas[i])
+                predict_noise, predict_label = model(x)
+                if i > 1:
+                    noise = torch.randn_like(x)
+                else:
+                    noise = 0
+                x = one_divide_sqrt_alpha*(x - (one_minus_alpha / sqrt_one_minus_cumpord_alpha)
+                                           * predict_noise) + sqrt_betas * noise
 
+                if i % step == 0:
+                    experiment.imshow_image(x, sub)
+                    sub += 1
+
+        return x, predict_label
 
 # U_net编码器部分的MBConv模块
 class MBConv(nn.Module):
@@ -381,14 +382,19 @@ class UNet(nn.Module):
                                      kernel_size=3, stride=1, padding=1)
         self.output_BN_1 = nn.BatchNorm2d(num_features=32)
         self.output_relu = nn.ReLU6()
-        self.output_conv2 = nn.Conv2d(in_channels=32, out_channels=9, kernel_size=1,
+        self.output_conv2 = nn.Conv2d(in_channels=32, out_channels=3, kernel_size=1,
                                       stride=1, padding=0)
-        self.output_BN_2 = nn.BatchNorm2d(num_features=9)
+        self.output_BN_2 = nn.BatchNorm2d(num_features=3)
 
-        self.classify = Classifier(9*32*32, 10)
+        self.classify = Classifier(3*32*32, 10)
 
+        self.Adap_conv = nn.Conv2d(in_channels=3, out_channels=9, kernel_size=1, stride=1,
+                                   padding=0)
 
     def forward(self, x):
+        if x.shape[1] != 9:
+            y = self.Adap_conv(x)
+            x = y
         # 通道数扩展和匹配阶段
         y = self.n_conv1(x)
 
@@ -426,33 +432,24 @@ class UNet(nn.Module):
         return predict_noise, predict_label
 
 
-
 if __name__ == "__main__":
     input = torch.rand([batch_size,3,32,32])        # 模拟图像数据
     time_step = torch.randint(0, T, (batch_size,)).long()      # 随机产生时间步
     label_step = torch.randint(0, 10, (batch_size, )).long()
 
+
     # 加噪过程 需要设置信号保有率α 噪声缩放因子β
-    add_noisy = Diffusion_Forward(T)        # 生成一个前向传播类 用于加噪和设置信号保有率参数
-    input = add_noisy.noising_adding(input, time_step)      # 对一整个批次同时加噪 并且时间步不同
+    ddpm = Diffusion(T)        # 生成一个前向传播类 用于加噪和设置信号保有率参数
+    input, real_noise = ddpm.forward(input, time_step)      # 对一整个批次同时加噪 并且时间步不同
+
 
     """
-        时间步编码助手 可以让所有时间步都有自己对应的编码
-        可以通过时间步随机采样建立与时间编码的索引关系
+    时间编码与类编编码
     """
-    Label_encoder = Label_Embedding(10, embedding_dim=batch_size)
-    label_embedding = Label_encoder(label_step)
-
-    Time_Embedding_util = Time_Embedding(Time_steps=T, dim=batch_size)
-    time_embedding = Time_Embedding_util(time_step)          # 根据当前批次做时间步选择
-    input = Time_Embedding_with_Pic_utils(input,time_embedding)     # 时间步编码与图像数据融合
-    input = Label_embedding_with_Pic_util(input, label_embedding)
-
+    Encoder = Embedding_Util(10, T, batch_size)
+    input = Encoder.time_embedding(input, time_step)
+    input = Encoder.label_embedding(input, label_step)
     model = UNet()
     predict_noise, predict_label = model(input)
 
-    print(predict_label)
-    print(predict_noise)
-    # print(predict_noise.shape)
-    # print(model)
-    # print(model.state_dict())
+
