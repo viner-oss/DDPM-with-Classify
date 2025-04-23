@@ -1,6 +1,9 @@
 import math
 import torch
+from sympy import false
 from torch import nn
+from torch.nn import MultiheadAttention
+
 import experiment
 
 # 设定参数 数据参数
@@ -11,31 +14,34 @@ width = 32
 T = 100  # 总时间步数
 beta_begin = 0.0001
 beta_end = 0.02
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 class Embedding_Util:
-    def __init__(self, num_classes:int, sum_timestep:int, dim:int):
+    def __init__(self, num_classes:int, sum_timestep:int, dim:int, device):
         self.num_classes = num_classes
         self.sun_timestep = sum_timestep
         self.dim = dim
-        label_position = positions = torch.arange(self.num_classes).unsqueeze(1).float()
+        self.device = device
+        label_position = torch.arange(self.num_classes).unsqueeze(1).float()
         time_position = torch.arange(self.sun_timestep).unsqueeze(1).float()
         div = torch.exp(torch.arange(0, self.dim, 2).float() * -(math.log(10000.0) / self.dim))
 
         label_embeddings = torch.zeros((self.num_classes, self.dim))
         label_embeddings[:, 0::2] = torch.sin(label_position * div)
         label_embeddings[:, 1::2] = torch.cos(label_position * div)
-        self.label_embeddings = label_embeddings
+        self.label_embeddings = label_embeddings.to(device)
 
         time_embeddings = torch.zeros((self.sun_timestep, self.dim))
         time_embeddings[:, 0::2] = torch.sin(time_position * div)
         time_embeddings[:, 1::2] = torch.cos(time_position * div)
-        self.time_embeddings = time_embeddings
+        self.time_embeddings = time_embeddings.to(device)
 
     def label_embedding(self, x, label):
         label_encoder = self.label_embeddings[label]
         in_channel = label_encoder.shape[1]
         out_channel = channel
-        fc = nn.Linear(in_features=in_channel, out_features=out_channel)
+        fc = nn.Linear(in_features=in_channel, out_features=out_channel).to(self.device)
         label_vector = fc(label_encoder)
         mapping_label_embedding = label_vector.unsqueeze(-1).unsqueeze(-1)
         mapping_label_embedding = mapping_label_embedding.expand(batch_size, -1, height, width)
@@ -46,7 +52,7 @@ class Embedding_Util:
         time_encoder = self.time_embeddings[time_step]
         in_channels = time_encoder.shape[1]
         out_channels = channel
-        fc = nn.Linear(in_features=in_channels, out_features=out_channels)
+        fc = nn.Linear(in_features=in_channels, out_features=out_channels).to(self.device)
         time_vector = fc(time_encoder)
         mapping_time_embedding = time_vector.unsqueeze(-1).unsqueeze(-1)
         mapping_time_embedding = mapping_time_embedding.expand(batch_size, -1, height, width)
@@ -57,79 +63,117 @@ class Embedding_Util:
 def skipped_connect(x, encode):
     return torch.cat([x,encode], dim=1)
 
-# 生成绝对位置编码
+# 生成二维图像的绝对位置编码  返回值是编码后的图像和新得到的通道数
 class Position_Embedding(nn.Module):
-    def __init__(self, patch_nums:int, embedding_dim:int):
+    def __init__(self, dim:int, expansion_factor, device):
         super().__init__()
-        self.patch_nums = patch_nums
-        self.embedding_dim = embedding_dim
+        self.expansion_factor = expansion_factor
+        self.dim = dim
+        self.hidden_dim = dim*2
+        self.device = device
+        self.div = torch.exp(torch.arange(0,dim,2).float() * -(math.log(10000.0)/dim)).unsqueeze(0).unsqueeze(0)
 
-        position = torch.arange(self.patch_nums).unsqueeze(1).float()
-        div = torch.exp(torch.arange(0,self.embedding_dim,2).float() * -(math.log(10000.0)/self.embedding_dim))
-        self.embeddings = torch.zeros([self.patch_nums, self.embedding_dim])
-        self.embeddings[:,0::2] = torch.sin(position * div)
-        self.embeddings[:,1::2] = torch.cos(position * div)
+    def forward(self,X):
+        batches, channels, height, width = X.shape
+        x_embedding = torch.zeros([self.dim, height, width], dtype=torch.float).to(self.device)
+        y_embedding = torch.zeros([self.dim, height, width], dtype=torch.float).to(self.device)
 
-    def forward(self,patch_index):
-        return self.embeddings[patch_index]
+        height = torch.arange(0, height, dtype=torch.float)
+        width = torch.arange(0, width, dtype=torch.float)
+        x, y = torch.meshgrid(height, width)
+        x = x.unsqueeze(2)
+        y = y.unsqueeze(2)
 
+        x_even = torch.sin(x * self.div).permute((2, 1, 0))
+        x_odd = torch.cos(x * self.div).permute((2, 1, 0))
+        y_even = torch.sin(y * self.div).permute((2, 1, 0))
+        y_odd = torch.cos(y * self.div).permute((2, 1, 0))
+        x_embedding[0::2, :, :] = x_even
+        x_embedding[1::2, :, :] = x_odd
+        y_embedding[0::2, :, :] = y_even
+        y_embedding[1::2, :, :] = y_odd
 
+        embedding = torch.cat([x_embedding, y_embedding], dim=0).unsqueeze(0).expand([batches, -1, -1, -1]).to(device=device)
+        Y = torch.cat([embedding, X], dim=1)
+        mbconv = MBConv(Y.shape[1], channels, self.expansion_factor, false)
+        Y = mbconv(Y)
 
-# 在跨层连接后 加入自注意力机制
-class SelfAttention(nn.Module):
-    def __init__(self, input_dim:int, hidden_dim:int, patch_size:int):
-        super().__init__()
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.patches_size = patch_size
+        return Y
 
-        self.W_q = nn.Linear(in_features=input_dim, out_features=hidden_dim)
-        self.W_k = nn.Linear(in_features=input_dim, out_features=hidden_dim)
-        self.W_v = nn.Linear(in_features=input_dim, out_features=hidden_dim)
-        self.sigmoid = nn.Sigmoid()
+"""
+github_SA
+"""
+class Self_Attn(nn.Module):
+    """ Self attention Layer"""
+
+    def __init__(self, in_dim, activation):
+        super(Self_Attn, self).__init__()
+        self.chanel_in = in_dim
+        self.activation = activation
+
+        self.query_conv = nn.Conv2d(in_channels=in_dim, out_channels=in_dim // 8, kernel_size=1)
+        self.key_conv = nn.Conv2d(in_channels=in_dim, out_channels=in_dim // 8, kernel_size=1)
+        self.value_conv = nn.Conv2d(in_channels=in_dim, out_channels=in_dim, kernel_size=1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+        self.softmax = nn.Softmax(dim=-1)  #
 
     def forward(self, x):
-        batches, channels, height, width = x.shape
-        height_num = height // self.patches_size
-        width_num = width // self.patches_size
+        """
+            inputs :
+                x : input feature maps( B X C X W X H)
+            returns :
+                out : self attention value + input feature
+                attention: B X N X N (N is Width*Height)
+        """
+        m_batchsize, C, width, height = x.size()
+        proj_query = self.query_conv(x).view(m_batchsize, -1, width * height).permute(0, 2, 1)  # B X CX(N)
+        proj_key = self.key_conv(x).view(m_batchsize, -1, width * height)  # B X C x (*W*H)
+        energy = torch.bmm(proj_query, proj_key)  # transpose check
+        attention = self.softmax(energy)  # BX (N) X (N)
+        proj_value = self.value_conv(x).view(m_batchsize, -1, width * height)  # B X C X N
 
-        embedding = Position_Embedding(channels*height_num*width_num, self.patches_size**2)
-        patches = []
-        index = 0
+        out = torch.bmm(proj_value, attention.permute(0, 2, 1))
+        out = out.view(m_batchsize, C, width, height)
 
-        for bat in range(batches):
-            for channel in range(channels):
-                for i in range(height_num):
-                    for j in range(width_num):
-                        patch = x[bat, channel, i*self.patches_size:(i+1)*self.patches_size,
-                                j*self.patches_size:(j+1)*self.patches_size]
-                        patch = torch.flatten(patch)
-                        patch += embedding(index)
-                        patches.append(patch.unsqueeze(1).float())
-                        index += 1
-            index = 0
+        out = self.gamma * out + x
+        return out
 
-        new_tensor = torch.stack(patches)
-        new_tensor = new_tensor.view([batches, channels, height_num * width_num,
-                                      self.patches_size * self.patches_size]).permute([0, 1, 3, 2])
+# 在跨层连接后 加入自注意力机制
+"""
+!!!分辨率过高时 记得切割图像 
+"""
+class SelfAttention(nn.Module):
+    def __init__(self, embed_dim:int, num_heads:int, in_channels:int, device):
+        super().__init__()
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.device = device
 
-        Q = self.W_q(new_tensor)
-        K = self.W_k(new_tensor)
-        V = self.W_v(new_tensor)
+        self.W_K = nn.Linear(in_features=self.in_channels, out_features=embed_dim).to(device=device)
+        self.W_Q = nn.Linear(in_features=self.in_channels, out_features=embed_dim).to(device=device)
+        self.W_V = nn.Linear(in_features=self.in_channels, out_features=embed_dim).to(device=device)
+        self.multihead = MultiheadAttention(embed_dim=self.embed_dim, num_heads=self.num_heads)
 
-        Attention_score = torch.matmul(K.transpose(-2, -1), Q) / self.hidden_dim ** 0.5
-        Attention_pro = self.sigmoid(Attention_score)
-
-        return torch.matmul(V, Attention_pro).view([batches, channels, height, width])
-
-
+    def forward(self, x):
+        batch, channels, height, width = x.shape
+        image_vector = x.view([batch, channels, height*width]).permute([2,0,1])
+        Q = self.W_Q(image_vector)
+        K = self.W_K(image_vector)
+        V = self.W_V(image_vector)
+        attn_output, _ = self.multihead(Q,K,V)
+        attn_output = (attn_output.view([height, width, batch, self.embed_dim])
+                             .permute([2, 3, 0, 1]))
+        return attn_output
 
 # 加噪过程中的参数选择
 class Diffusion:
-    def __init__(self, num_time_steps:int, beta_src:float=0.0001, beta_cls:float=0.02):
+    def __init__(self, num_time_steps:int, device, beta_src:float=0.0001, beta_cls:float=0.02):
         self.time_step = num_time_steps
         self.beta_src = beta_src
         self.beta_cls = beta_cls
+        self.device = device
 
         # 对信号保留率α  噪声权值β  做提前处理  这里选择线性调度
         self.betas = torch.linspace(beta_src, beta_cls, steps=T, dtype=torch.float)      # β[]
@@ -140,13 +184,13 @@ class Diffusion:
 
     def forward(self, x_0, time_step):
         noise = torch.randn_like(x_0)
-        batch_sqrt_cumpord_alphas = self.sqrt_cumpord_alphas[time_step].view([x_0.shape[0],1,1,1])
-        batch_sqrt_one_minus_cumpord_alphas = self.sqrt_one_minus_cumpord_alphas[time_step].view([x_0.shape[0],1,1,1])
+        batch_sqrt_cumpord_alphas = self.sqrt_cumpord_alphas[time_step].view([x_0.shape[0],1,1,1]).to(self.device)
+        batch_sqrt_one_minus_cumpord_alphas = self.sqrt_one_minus_cumpord_alphas[time_step].view([x_0.shape[0],1,1,1]).to(self.device)
 
         return (x_0*batch_sqrt_cumpord_alphas+noise*batch_sqrt_one_minus_cumpord_alphas,
                 noise)
 
-    def prediction(self, model, time_step, x):
+    def prediction(self, model, time_step, epcho, test_step, x, flag:bool):
         with torch.no_grad():
             step = math.ceil(time_step[0] / 16)
             sub = 1
@@ -163,8 +207,8 @@ class Diffusion:
                 x = one_divide_sqrt_alpha*(x - (one_minus_alpha / sqrt_one_minus_cumpord_alpha)
                                            * predict_noise) + sqrt_betas * noise
 
-                if i % step == 0:
-                    experiment.imshow_image(x, sub)
+                if i % step == 0 and flag:
+                    experiment.imshow_image(x, sub, epcho, test_step)
                     sub += 1
 
         return x, predict_label
@@ -226,8 +270,6 @@ class MBConv(nn.Module):
             y += x
         return y
 
-
-
 # mobile_netV1的普通卷积 以适应初始操作
 class Mobile_Conv(nn.Module):
     def __init__(self, in_channels:int, out_channels:int):
@@ -264,8 +306,6 @@ class Mobile_Conv(nn.Module):
         y = self.conv_increase(y)
         return y
 
-
-
 # 编码器部分
 class Encode(nn.Module):
     def __init__(self, in_channels:int, out_channels:int, expansion_factor:int):
@@ -287,8 +327,6 @@ class Encode(nn.Module):
 
         return y
 
-
-
 # 上采样块
 class Up_Sample(nn.Module):
     def __init__(self, in_channels:int, out_channels:int):
@@ -303,7 +341,6 @@ class Up_Sample(nn.Module):
         y = self.up_sample(x)
         return y
 
-
 # 解码器
 class Decoder(nn.Module):
     """
@@ -311,7 +348,7 @@ class Decoder(nn.Module):
     因为在堆叠后通道数会加倍 所以还需要一次卷积来将通道数融合减半
     """
     def __init__(self, input_dim:int, hidden_dim:int, patch_size:int, in_channels:int, out_channels,
-                 expansion_factor:int):
+                 expansion_factor:int, num_heads:int):
         super().__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
@@ -320,13 +357,16 @@ class Decoder(nn.Module):
         self.out_channels = out_channels
         self.expansion_factor = expansion_factor
 
-        self.self_attention = SelfAttention(input_dim=self.input_dim, hidden_dim=self.hidden_dim,
-                                            patch_size=self.patch_size)
-        self.mbconv = MBConv(in_channels=self.in_channels, out_channels=self.out_channels,
-                             expansion_factor=self.expansion_factor, res=False)
+        self.Position_embed = Position_Embedding(dim=self.in_channels,
+                            expansion_factor=expansion_factor, device=device)
+        self.self_attention = SelfAttention(embed_dim=out_channels, num_heads=num_heads,
+                                            in_channels=in_channels, device=device)
+        self.mbconv = MBConv(in_channels=self.out_channels, out_channels=self.out_channels,
+                             expansion_factor=self.expansion_factor, res=True)
 
     def forward(self, x, encode):
         y = skipped_connect(x, encode)
+        y = self.Position_embed(y)
         y = self.self_attention(y)
         y = self.mbconv(y)
         y += x
@@ -350,7 +390,6 @@ class Classifier(nn.Module):
 
         return y
 
-
 # 主模型
 """
 通道数和参数的修改在这里进行
@@ -369,13 +408,13 @@ class UNet(nn.Module):
 
         #  上采样过程
         self.up_sample1 = Up_Sample(1024,512)
-        self.decoder1 = Decoder(2*2,2*2,2,1024,512,6)
+        self.decoder1 = Decoder(2*2,2*2,2,1024,512,6, 8)
         self.up_sample2 = Up_Sample(512,256)
-        self.decoder2 = Decoder(2*2,2*2,4,512,256,3)
+        self.decoder2 = Decoder(2*2,2*2,4,512,256,3, 8)
         self.up_sample3 = Up_Sample(256, 128)
-        self.decoder3 = Decoder(4*4, 4*4, 4, 256, 128, 3)
+        self.decoder3 = Decoder(4*4, 4*4, 4, 256, 128, 3, 8)
         self.up_sample4 = Up_Sample(128, 64)
-        self.decoder4 = Decoder(4*4, 4*4, 8, 128, 64, 1)
+        self.decoder4 = Decoder(4*4, 4*4, 8, 128, 64, 1, 8)
 
         # 输出层
         self.output_conv1 = nn.Conv2d(in_channels=64, out_channels=32,
@@ -439,14 +478,14 @@ if __name__ == "__main__":
 
 
     # 加噪过程 需要设置信号保有率α 噪声缩放因子β
-    ddpm = Diffusion(T)        # 生成一个前向传播类 用于加噪和设置信号保有率参数
+    ddpm = Diffusion(T, device)        # 生成一个前向传播类 用于加噪和设置信号保有率参数
     input, real_noise = ddpm.forward(input, time_step)      # 对一整个批次同时加噪 并且时间步不同
 
 
     """
     时间编码与类编编码
     """
-    Encoder = Embedding_Util(10, T, batch_size)
+    Encoder = Embedding_Util(10, T, batch_size, device)
     input = Encoder.time_embedding(input, time_step)
     input = Encoder.label_embedding(input, label_step)
     model = UNet()
