@@ -7,7 +7,7 @@ import torch
 T = 100
 batch_size = 64
 simulate_image = torch.randn([batch_size,3,32,32])
-bat = random.randint(0, batch_size)
+bat = 32
 
 # time_step = torch.randint(0, T, (batch_size,)).long()
 # label_step = torch.randint(0, 10, (batch_size, )).long()
@@ -98,7 +98,6 @@ def graph_show(real_np_noise, predict_np_noise):
                 xy=(predict_mean, Gaussian(predict_mean, mean=predict_mean, std=predict_std)),
                  xytext=(+30,0), xycoords='data', textcoords='offset points')
 
-
     # 同时显示对比
     plt.figure(num=2, label='real && predict', figsize=(6,6))
     plt.subplot(1,1,1)
@@ -151,7 +150,7 @@ def graph_show(real_np_noise, predict_np_noise):
 
     plt.imshow(np.swapaxes(np.swapaxes(predict_clip[:,:,:], axis1=0, axis2=1), axis1=1, axis2=2), cmap='bone', interpolation='nearest', origin='upper')
 
-    plt.show()
+
 
 
 
@@ -159,7 +158,7 @@ def graph_show(real_np_noise, predict_np_noise):
 显示还原过程的图像历程
 预测过程可以尝试使用
 """
-def imshow_image(x, i):
+def imshow_image(x, i, epcho, test_step):
     image_numpy = x[bat,:,:,:].numpy()
     image_scale = (image_numpy - np.min(image_numpy)) / (np.max(image_numpy) - np.min(image_numpy)) * 255
     image_clip = np.clip(image_scale, 0, 255).astype(np.uint8)
@@ -167,14 +166,14 @@ def imshow_image(x, i):
     plt.subplot(4,4,i)
     image = np.swapaxes(np.swapaxes(image_clip[:,:,:], axis1=0, axis2=1), axis1=1, axis2=2)
     plt.imshow(image, cmap='bone', interpolation='nearest', origin='upper')
-    plt.imsave(f'D:\python\Segmentation\experiment\denoise_process{i}.png', arr=image)
+    plt.imsave(f'D:\python\Segmentation\experiment\denoise_process{test_step}_{epcho}_{i}.png', arr=image)
 
 
 
 if __name__ == "__main__":
     # graph_show(real_np_noise=real_noise, predict_np_noise=predict_noise)
     plt.figure(label='prediction')
-    for i in range(5):
-        imshow_image(simulate_image, i+1)
+    for i in range(100):
+        imshow_image(simulate_image, i+1, 1)
 
     plt.show()
