@@ -1,3 +1,4 @@
+import random
 import torchvision
 import torch
 from torch.nn import MSELoss, CrossEntropyLoss
@@ -18,6 +19,7 @@ T = 100            # 总时间步数
 beta_begin = 0.00002
 beta_end = 0.0001
 epcho = 500        # 训练轮数
+num_classes = 10 # 类别个数
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 """
 时间步编码和位置编码
@@ -104,3 +106,36 @@ for i in range(epcho):
              print(f"训练次数为{total_train_step}时,损失值是{loss.item()}")
              writer.add_scalar("train_loss", loss.item(), total_train_step)
          torch.cuda.empty_cache()
+
+
+     print(f"-----test {i+1} begin-----")
+     total_accuracy = 0
+     with torch.no_grad():
+         for CNT in range(100):
+             origin_noise = torch.randn([batch_size, 3, 32, 32]).to(device)
+             t = random.randint(1, T)  # 随机产生时间步
+             label = random.randint(1, num_classes)
+             time_step = torch.full((batch_size,),t)
+             label_step = torch.full((batch_size,), label)
+
+             # 按照标签和时间步一步一步还原
+             input_img = time_label_encoder.time_embedding(origin_noise, time_step)
+             input_img = time_label_encoder.label_embedding(input_img, label_step)
+
+             if total_test_step % 20 == 0:
+                 predict_img, eval_predict_label = ddpm.prediction(model, time_step, i+1,
+                            test_step=total_test_step, x=input_img, flag=True)
+             else:
+                predict_img, eval_predict_label = ddpm.prediction(model, time_step, i+1,
+                            test_step=total_test_step, x=input_img, flag=False)
+
+             accuracy = (eval_predict_label.argmax(1) == label).sum()
+             total_accuracy = total_accuracy + accuracy
+             total_test_step += 1
+         print(f"accuracy in test {i+1}:{total_accuracy / test_set_size}")
+         print()
+
+
+torch.save(model.state_dict(), 'DDPM_predict_parameters.pt')
+
+writer.close()
