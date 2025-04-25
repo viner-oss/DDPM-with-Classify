@@ -95,7 +95,7 @@ class Position_Embedding(nn.Module):
 
         embedding = torch.cat([x_embedding, y_embedding], dim=0).unsqueeze(0).expand([batches, -1, -1, -1]).to(device=device)
         Y = torch.cat([embedding, X], dim=1)
-        mbconv = MBConv(Y.shape[1], channels, self.expansion_factor, false)
+        mbconv = MBConv(Y.shape[1], channels, self.expansion_factor, false).to(device)
         Y = mbconv(Y)
 
         return Y
