@@ -8,6 +8,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torchvision.transforms import transforms
 import DDPM
 from DDPM import Embedding_Util
+import experiment
 
 """
 基本参数设置
@@ -18,7 +19,7 @@ width = 32
 T = 100            # 总时间步数
 beta_begin = 0.00002
 beta_end = 0.0001
-epcho = 500        # 训练轮数
+epcho = 100        # 训练轮数
 num_classes = 10 # 类别个数
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 """
@@ -26,6 +27,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 """
 ddpm = DDPM.Diffusion(num_time_steps=T, device=device)       # 添加前向传播类 用于设置α β 添加噪声
 time_label_encoder = Embedding_Util(10, T, batch_size, device)
+Position_encoder = DDPM.Position_Embedding(dim=2, expansion_factor=3, device=device)
 
 # 图像预处理
 mean = (0.4914, 0.4822, 0.4465)
@@ -59,7 +61,6 @@ learning_rate_max = 0.0001
 # 模型 损失函数 优化器 余弦退火
 model = DDPM.UNet().to(device)
 noise_loss = MSELoss().to(device)
-label_loss = CrossEntropyLoss().to(device)
 optimizer = AdamW(model.parameters(),lr=learning_rate_max)
 scheduler = lr_scheduler.CosineAnnealingLR(
     optimizer=optimizer,
@@ -67,15 +68,16 @@ scheduler = lr_scheduler.CosineAnnealingLR(
     eta_min=learning_rate_min
 )
 
-"""need or no need pretrained_weight
 """
-# pretrained_dict = torch.load('D:\python\Segmentation\DDPM_parameters.pt')
-# model.load_state_dict(pretrained_dict)
+need or no need pretrained_weight
+"""
+pretrained_dict = torch.load(r'C:\Users\lenovo\Desktop\DDPM\Parameters\DPM_parameters_120.pt')
+model.load_state_dict(pretrained_dict)
 
 # 日志记录
-writer = SummaryWriter("./DDPM_independent_noise_LOG")
+writer = SummaryWriter("DDPM_Multi_head_LOG")
 
-total_train_step = 0        # 每训练完一个patch 结果+1
+total_train_step = 0        # 每训练完一个patch 结果+1DDPM_parameters.pt
 total_test_step = 1         # 每预测完一个patch 结果+1
 
 # train_stage 单独训练生成模型
@@ -89,11 +91,12 @@ for i in range(epcho):
 
          input_img, real_noise = ddpm.forward(img, time_step)
          input_img = time_label_encoder.time_embedding(input_img, time_step)
-         input_img = time_label_encoder.label_embedding(input_img, label)
-         predict_noise, train_predict_label = model(input_img)
+         # input_img = time_label_encoder.label_embedding(input_img, label)   # 是否需要加入类别标签辅助生成
+         input_img = Position_encoder(input_img)
+
+         predict_noise = model(input_img)
 
          loss_noise = noise_loss(predict_noise, real_noise)   # 计算噪声损失值
-         loss_classify = label_loss(train_predict_label, label)    # 计算类别损失值
          loss = loss_noise
 
          # 优化器优化模型
@@ -106,36 +109,28 @@ for i in range(epcho):
              print(f"训练次数为{total_train_step}时,损失值是{loss.item()}")
              writer.add_scalar("train_loss", loss.item(), total_train_step)
          torch.cuda.empty_cache()
+         if total_train_step % 700 == 0:
+             experiment.graph_show(real_noise, predict_noise, total_train_step)
 
+     torch.save(model.state_dict(), fr'C:\Users\lenovo\Desktop\DDPM\Parameters/DPM_parameters_{i}.pt')
 
-     print(f"-----test {i+1} begin-----")
-     total_accuracy = 0
-     with torch.no_grad():
-         for CNT in range(100):
-             origin_noise = torch.randn([batch_size, 3, 32, 32]).to(device)
-             t = random.randint(1, T)  # 随机产生时间步
-             label = random.randint(1, num_classes)
-             time_step = torch.full((batch_size,),t)
-             label_step = torch.full((batch_size,), label)
-
-             # 按照标签和时间步一步一步还原
-             input_img = time_label_encoder.time_embedding(origin_noise, time_step)
-             input_img = time_label_encoder.label_embedding(input_img, label_step)
-
-             if total_test_step % 20 == 0:
-                 predict_img, eval_predict_label = ddpm.prediction(model, time_step, i+1,
-                            test_step=total_test_step, x=input_img, flag=True)
-             else:
-                predict_img, eval_predict_label = ddpm.prediction(model, time_step, i+1,
-                            test_step=total_test_step, x=input_img, flag=False)
-
-             accuracy = (eval_predict_label.argmax(1) == label).sum()
-             total_accuracy = total_accuracy + accuracy
-             total_test_step += 1
-         print(f"accuracy in test {i+1}:{total_accuracy / test_set_size}")
-         print()
-
-
-torch.save(model.state_dict(), 'DDPM_predict_parameters.pt')
+     # model.eval()
+     # print(f"-----test {i+1} begin-----")
+     # with torch.no_grad():
+     #     for CNT in range(1,51):
+     #         origin_noise = torch.randn([batch_size, 3, 32, 32]).to(device)
+     #         t = T                    # 随机产生时间步
+     #         if CNT % 5 == 0:
+     #             predict_img = ddpm.prediction(model, t, CNT,
+     #                        test_step=total_test_step, x=origin_noise, appointed_label=0, flag=True)
+     #         else:
+     #             predict_img = ddpm.prediction(model, t, CNT,
+     #                        test_step=total_test_step, x=origin_noise, appointed_label=0, flag=False)
+     #
+     #         total_test_step += 1
+     #
+     #     print("image save!")
 
 writer.close()
+
+
