@@ -1,6 +1,5 @@
 import math
 import torch
-from sympy import false
 from torch import nn
 from torch.nn import MultiheadAttention
 
@@ -63,7 +62,7 @@ class Embedding_Util:
 def skipped_connect(x, encode):
     return torch.cat([x,encode], dim=1)
 
-# 生成二维图像的绝对位置编码  返回值是编码后的图像和新得到的通道数
+# 生成二维图像的绝对位置编码  返回值是编码后的图像和新得到的通道数 维度必须是偶数 与最开始输入通道的关系是 2*dim + label_channels + time_channels + image_channels
 class Position_Embedding(nn.Module):
     def __init__(self, dim:int, expansion_factor, device):
         super().__init__()
@@ -74,7 +73,8 @@ class Position_Embedding(nn.Module):
         self.div = torch.exp(torch.arange(0,dim,2).float() * -(math.log(10000.0)/dim)).unsqueeze(0).unsqueeze(0)
 
     def forward(self,X):
-        batches, channels, height, width = X.shape
+        batches, _, height, width = X.shape
+        channels = channel
         x_embedding = torch.zeros([self.dim, height, width], dtype=torch.float).to(self.device)
         y_embedding = torch.zeros([self.dim, height, width], dtype=torch.float).to(self.device)
 
@@ -95,8 +95,8 @@ class Position_Embedding(nn.Module):
 
         embedding = torch.cat([x_embedding, y_embedding], dim=0).unsqueeze(0).expand([batches, -1, -1, -1]).to(device=device)
         Y = torch.cat([embedding, X], dim=1)
-        mbconv = MBConv(Y.shape[1], channels, self.expansion_factor, false).to(device)
-        Y = mbconv(Y)
+        # mbconv = MBConv(Y.shape[1], channels, self.expansion_factor, false).to(device)
+        # Y = mbconv(Y)
 
         return Y
 
@@ -181,6 +181,8 @@ class Diffusion:
         self.cumpord_alphas = torch.cumprod(self.alphas,dim=0)        # 对特定时间步α的累乘
         self.sqrt_one_minus_cumpord_alphas = torch.sqrt(1-self.cumpord_alphas)
         self.sqrt_cumpord_alphas = torch.sqrt(self.alphas)
+        self.time_label_encoder = Embedding_Util(10, T, batch_size, device)
+        self.Position_encoder = Position_Embedding(dim=2, expansion_factor=3, device=device)
 
     def forward(self, x_0, time_step):
         noise = torch.randn_like(x_0)
@@ -190,28 +192,33 @@ class Diffusion:
         return (x_0*batch_sqrt_cumpord_alphas+noise*batch_sqrt_one_minus_cumpord_alphas,
                 noise)
 
-    def prediction(self, model, time_step, epcho, test_step, x, flag:bool):
+    # 返回值是生成的图像
+    def prediction(self, model, time_step, epcho, test_step, x, appointed_label, flag:bool):
         with torch.no_grad():
-            step = math.ceil(time_step[0] / 16)
+            step = math.ceil(time_step / 16)
             sub = 1
-            for i in reversed(range(time_step[0])):
+            for i in reversed(range(time_step)):
                 one_divide_sqrt_alpha = 1 / torch.sqrt(self.alphas[i])
                 one_minus_alpha = 1 - self.alphas[i]
                 sqrt_one_minus_cumpord_alpha = self.sqrt_one_minus_cumpord_alphas[i]
                 sqrt_betas = torch.sqrt(self.betas[i])
-                predict_noise, predict_label = model(x)
+                input_img = self.time_label_encoder.time_embedding(x, torch.full((batch_size,),i))
+                # input_img = self.time_label_encoder.label_embedding(input_img, torch.full((batch_size,),appointed_label))   # 是否需要类别标签辅助生成
+                input_img = self.Position_encoder(input_img).to(device)
+
+                predict_noise = model(input_img)
                 if i > 1:
                     noise = torch.randn_like(x)
                 else:
                     noise = 0
-                x = one_divide_sqrt_alpha*(x - (one_minus_alpha / sqrt_one_minus_cumpord_alpha)
-                                           * predict_noise) + sqrt_betas * noise
+
+                x = one_divide_sqrt_alpha*(x - ((one_minus_alpha / sqrt_one_minus_cumpord_alpha) * predict_noise)) + sqrt_betas * noise
 
                 if i % step == 0 and flag:
                     experiment.imshow_image(x, sub, epcho, test_step)
                     sub += 1
 
-        return x, predict_label
+        return x
 
 # U_net编码器部分的MBConv模块
 class MBConv(nn.Module):
@@ -347,28 +354,26 @@ class Decoder(nn.Module):
     input_dim是指每张特征图中patch的个数   hidden_dim通常情况下与input_dim数量相同
     因为在堆叠后通道数会加倍 所以还需要一次卷积来将通道数融合减半
     """
-    def __init__(self, input_dim:int, hidden_dim:int, patch_size:int, in_channels:int, out_channels,
-                 expansion_factor:int, num_heads:int):
+    def __init__(self, in_channels:int, out_channels:int, expansion_factor:int, num_heads:int):
         super().__init__()
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.patch_size = patch_size
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.expansion_factor = expansion_factor
 
-        self.Position_embed = Position_Embedding(dim=self.in_channels,
-                            expansion_factor=expansion_factor, device=device)
         self.self_attention = SelfAttention(embed_dim=out_channels, num_heads=num_heads,
                                             in_channels=in_channels, device=device)
-        self.mbconv = MBConv(in_channels=self.out_channels, out_channels=self.out_channels,
-                             expansion_factor=self.expansion_factor, res=True)
+        self.SA = Self_Attn(in_dim=in_channels, activation='relu')
+
+        self.mbconv = MBConv(in_channels=self.in_channels, out_channels=self.out_channels,
+                             expansion_factor=self.expansion_factor, res=False)
 
     def forward(self, x, encode):
         y = skipped_connect(x, encode)
-        y = self.Position_embed(y)
-        y = self.self_attention(y)
-        y = self.mbconv(y)
+
+        y = self.self_attention(y)      # 多头注意力机制
+
+        # y = self.SA(y)                # 单头注意力机制
+        # y = self.mbconv(y)
         y += x
         return y
 
@@ -397,7 +402,7 @@ class Classifier(nn.Module):
 class UNet(nn.Module):
     def __init__(self):
         super().__init__()
-        self.n_conv1 = Mobile_Conv(9,32)
+        self.n_conv1 = Mobile_Conv(10,32)
         self.n_conv2 = Mobile_Conv(32, 64)
 
         # 下采样过程
@@ -408,13 +413,13 @@ class UNet(nn.Module):
 
         #  上采样过程
         self.up_sample1 = Up_Sample(1024,512)
-        self.decoder1 = Decoder(2*2,2*2,2,1024,512,6, 8)
+        self.decoder1 = Decoder(1024,512,6, 8)
         self.up_sample2 = Up_Sample(512,256)
-        self.decoder2 = Decoder(2*2,2*2,4,512,256,3, 8)
+        self.decoder2 = Decoder(512,256,3, 8)
         self.up_sample3 = Up_Sample(256, 128)
-        self.decoder3 = Decoder(4*4, 4*4, 4, 256, 128, 3, 8)
+        self.decoder3 = Decoder( 256, 128, 3, 8)
         self.up_sample4 = Up_Sample(128, 64)
-        self.decoder4 = Decoder(4*4, 4*4, 8, 128, 64, 1, 8)
+        self.decoder4 = Decoder( 128, 64, 1, 8)
 
         # 输出层
         self.output_conv1 = nn.Conv2d(in_channels=64, out_channels=32,
@@ -431,10 +436,6 @@ class UNet(nn.Module):
                                    padding=0)
 
     def forward(self, x):
-        if x.shape[1] != 9:
-            y = self.Adap_conv(x)
-            x = y
-        # 通道数扩展和匹配阶段
         y = self.n_conv1(x)
 
         # 编码器部分
@@ -466,13 +467,12 @@ class UNet(nn.Module):
         y = self.output_BN_2(y)
 
         predict_noise = y
-        predict_label = self.classify(y)
 
-        return predict_noise, predict_label
+        return predict_noise
 
 
 if __name__ == "__main__":
-    input = torch.rand([batch_size,3,32,32])        # 模拟图像数据
+    input = torch.rand([batch_size,3,32,32]).to(device)        # 模拟图像数据
     time_step = torch.randint(0, T, (batch_size,)).long()      # 随机产生时间步
     label_step = torch.randint(0, 10, (batch_size, )).long()
 
@@ -486,9 +486,12 @@ if __name__ == "__main__":
     时间编码与类编编码
     """
     Encoder = Embedding_Util(10, T, batch_size, device)
-    input = Encoder.time_embedding(input, time_step)
-    input = Encoder.label_embedding(input, label_step)
-    model = UNet()
-    predict_noise, predict_label = model(input)
+    Position_encoder = Position_Embedding(dim=2, expansion_factor=3, device=device)
 
+    input = Encoder.time_embedding(input, time_step)
+    # input = Encoder.label_embedding(input, label_step)    # 是否需要利用类别标签辅助生成
+    input = Position_encoder(input)
+
+    model = UNet().to(device)
+    predict_noise = model(input)
 
